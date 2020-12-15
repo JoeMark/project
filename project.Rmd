@@ -1,11 +1,13 @@
 ---
-title: "Harvard project"
+title: "HarvardX - PH125.9x Movielens project"
 author: "Joe Mark Lippert"
-date: "29/07/2020"
-output: html_document
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document: default
+  pdf_document: default
 ---
 
-```{r setup, include=FALSE}
+```{r setup, include=FALSE, warning=FALSE}
 if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
 if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
 if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
@@ -48,26 +50,529 @@ validation <- temp %>%
 removed <- anti_join(temp, validation)
 edx <- rbind(edx, removed)
 
-rm(dl, ratings, movies, test_index, temp, movielens, removed)
+rm(dl, ratings, movies, test_index, movielens, temp, removed)
 
 ```
 
-## R Markdown
+### Introduction
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+Let me make clear right from the start that the work contained herein should be credited to Prof. Rafa Irizarry and his team. Most of the code seen in the solution is found in the textbook provided to us.
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+Now let's begin. The dataset is the **movielens** dataset that contains ratings for movies by users. The Netflix data is not publicly available so instead we are instructed to use the **movielens** dataset. It is accessible from the [Grouplens](https://grouplens.org) website but the code to access it, split it into 2 sets, was given to us by Professor Rafa Irizarry and is the code you see in the `setup` code chunk. The dataset has **9 000 055** rows and **6** columns. The predictor variables are:
 
-```{r cars}
-summary(cars)
+1. **userId**,
+2. **movieId**,
+3. **timestamp**,
+4. **title**, and
+5. **genres**.
+
+The outcome variable is **rating**.
+
+The objective of the project is to simulate the solution offered by the winners of Netflix's 2006 challenge by applying their algorithmic approach to our project. The challenge was to improve Netflix's movie recommendation algorithm by 10%. The winners used a Machine Learning algorithm to predict the **rating** of movies by users who did not rate all the movies. 
+
+The key steps are:
+
+* look at the data (it's always a good idea to look at the data),
+* model a simple regression function,
+* augment the model to incorporate the movie and user effects, and further augment the model to adjust for overfitting by incorporating the regularisation technique,
+* assess the algorithm by using the RMSE (root mean squared error) loss function.
+
+### Methods/Analysis
+
+#### General properties  
+
+A first step in the analysis process is to look at the data. With any dataset it is always a good idea to take a look around. Identify the features and output and strategise an approach to preprocessing. Let's look at the training dataset (edx); the names of the features, output, type of vectors (variables). 
+
+```{r analysis-dataset, echo=TRUE}
+
+# First let's take a glimpse at the edx (training) dataset
+glimpse(edx)
+
+# now let's look at the first 10 items of the edx dataset
+edx %>% as_tibble()
+
 ```
 
-## Including Plots
+Each row represents a rating given by a single user for a single movie.
 
-You can also embed plots, for example:
+Now let's determine the number of unique movies, the number of unique users and the number of ratings (classes).
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+```{r analysis-distinct, echo=FALSE}
+edx %>%
+  summarise(users = n_distinct(userId),
+            movies = n_distinct(movieId),
+            ratings = n_distinct(rating))
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+Now, show the maximum possible number of ratings if each user gives a single rating
+to each unique movie.
+
+```{r maximum-ratings, echo=FALSE}
+edx %>%
+  summarise(users=n_distinct(userId),
+            movies=n_distinct(movieId),
+            total=users*movies) %>% .$total
+```
+
+The movielens dataset is a long dataset. It is not 'friendly' in the long format. Instead in order to see the dataset in a more useful format we need to transform it into a wide format. 
+Not every user rated every movie. The following snippet of code shows the wide format and shows clearly that every user does not rate every movie. So we end with lots of NAs when we convert to the wide format.
+
+```{r matrix-1, echo=TRUE, warning=FALSE}
+set.seed(2, sample.kind = "Rounding")
+mat <- edx %>%
+  slice_sample(n=4) %>% select(userId, title, rating) %>%
+  spread(key = title, value = rating)
+
+mat[, 2:5]
+```
+
+Now let's visualise a matrix with 100 movies and 100 users. Here we see every mark is a rating. The graphic shows clearly that every user does not rate every movie, hence the many gaps.
+
+```{r matrix-2, echo=FALSE, warning=FALSE}
+set.seed(30)
+a <- edx %>% slice_sample(n =100) %>% select(userId, title, rating) %>%
+  spread(key = title, value = rating) %>% as.matrix()
+
+colnames(a) <- 1:ncol(a)
+
+y <- 1:ncol(a)-1
+x <- 1:nrow(a)
+image(x, y, a[, -1], col = rainbow(1), xlab = "movies", ylab = "users")
+```
+
+Now, let's look at some general properties of the data, like distribution of the movieId variable. The graphic below shows the varying popularity of individual movies.
+
+```{r distribution-movieId, echo=FALSE}
+edx %>% filter(movieId <= 30) %>%
+ggplot(aes(x=fct_infreq(as.factor(movieId)))) +
+  geom_bar() +
+  labs(x = "movieId", y = "number of times rated", title = "Movies")
+```
+
+Again, in the graph below we see that some users are much more engaged than others. By example, user 8 rated much more movies than user 2.
+
+```{r distribution-userId, echo=FALSE}
+edx %>% filter(userId <= 30) %>%
+ggplot(aes(x=fct_infreq(as.factor(userId)))) +
+  geom_bar() +
+  labs(x = "userId", y = "number of movies rated", title = "Users")
+```
+
+Now let's begin the process of building a predictive algorithm that predicts the rating in the spaces filled with NAs in the wide format of the data.  
+
+First, let's create a test set using edx.
+
+```{r test-train, echo=TRUE, warning=FALSE}
+set.seed(755, sample.kind = "Rounding")
+test_index <- createDataPartition(y = edx$rating, times = 1, p = 0.2,
+                                  list = FALSE)
+train_set <- edx[-test_index, ]
+test_set <- edx[test_index, ]
+```
+
+Let's make sure we do not include users and movies in the test set that do not appear in
+the train set.
+
+```{r complete_test_set, echo=TRUE}
+test_set <- test_set %>%
+  semi_join(train_set, by = "movieId") %>%
+  semi_join(train_set, by = "userId")
+
+```
+
+#### Loss function  
+
+Before we continue let us state how we shall assess and evaluate our algorithm.
+
+The prediction error for the $i^{th}$ data point is:
+$predicted$ $value_{i}$ - $actual$ $value_{i}$
+
+Netflix decided that the winners would be adjudged based on the root mean squared error (RMSE) on the test set.
+RMSE is the standard deviation of the residuals (prediction errors). The RMSE is defined as:
+
+$$RMSE = \sqrt{\frac{1}{N}\sum_{u,i}\left(\hat{y}_{u,i}-y_{u,i}\right)^2}$$
+Here is the function that computes the RMSE for vectors of ratings and their predictors: 
+
+```{r RMSE_function, echo=TRUE}
+RMSE <- function(true_ratings, predicted_ratings){
+sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+```
+
+#### Simple model
+
+Now let's begin with the simplest recommendation algorithm: A model that predicts the same rating for every movie regardless of the user.
+
+$$Y_{u,i} = \mu + \epsilon_{u,i}$$
+$Y_{u,i}$ is the total rating per movie.  
+
+$\mu$ is the rating that we assign to each movie.  
+
+$\epsilon_{u,i}$ are the independent errors.  
+
+The estimate that minimises the RMSE is the least squares estimate of $\mu$ which is the average of all the ratings.
+
+We calculate $\mu$ like this: 
+
+```{r mu_hat, echo=TRUE}
+mu_hat <- mean(train_set$rating)
+mu_hat
+```
+
+If we predict that all unknown ratings equals $\hat{\mu}$ then the RMSE is:  
+
+```{r naive_rmse, echo=TRUE}
+naive_rmse <- RMSE(test_set$rating, mu_hat)
+naive_rmse
+```
+
+#### Model that incorporates movie effects  
+
+Now let us include the fact that some movies are obviously more popular than others and therefore are rated differently. To reflect this fact we augment our equation to include this fact.
+
+$$Y_{u,i} = \mu + b_{i} + \epsilon_{u,i}$$
+The $b_{i}$ reflects the average ranking for movie $i$. We can use least squares to estimate   $b_{i}$ by using the `lm` function but because we have very many movies this process will be very slow. Instead, because we know that for this situation the least squares estimate $\hat{b_{i}}$ is the average of $Y_{u,i}-\hat{\mu_{i}}$ for each movie $i$.
+So we compute $b_{i}$ as follows: (Note: going forward we drop the hat)
+
+```{r b_i_computation, echo=TRUE, message=FALSE}
+mu <- mean(train_set$rating)
+movie_avgs <- train_set %>%
+  group_by(movieId) %>%
+  summarize(b_i = mean(rating - mu))
+```
+
+The graph below shows the variation in bias.
+
+```{r movie_bias, echo=FALSE}
+qplot(b_i, data = movie_avgs, bins = 10, color = I("black"))
+
+```
+
+Now let's see how much our prediction improves when we use $\hat{y}_{u,i} = \hat{\mu}_{i}+\hat{b}_{i}$:
+
+```{r movie_rmse, echo=TRUE}
+predicted_ratings <- mu + test_set %>%
+  left_join(movie_avgs, by="movieId") %>%
+  pull(b_i)
+
+movie_effect <- RMSE(predicted_ratings, test_set$rating)
+movie_effect
+```
+
+We see that our loss function has improved.
+
+#### User effects
+
+Let's look at the average rating of users who have rated more than 100 movies and graph the  variability. Then factor this bias effect into our model.
+```{r user_effect1, echo=TRUE, message=FALSE}
+train_set %>%
+  group_by(userId) %>%
+  summarise(b_u = mean(rating)) %>%
+  filter(n() >= 100) %>%
+  ggplot(aes(b_u)) +
+  geom_histogram(bins = 30, color = "black")
+```
+
+From the graphic you can see that some users are harsh critics and others simply love movies and are generous in their praise. So we further augment our model to include this effect and it becomes:
+$$Y_{u,i} = \mu + b_{i} + b_{u} + \epsilon_{u,i}$$
+where $b_{u}$ is a user specific effect.
+To fit the model we could use the `lm` function but as explained above, it would be a slow process. Instead we will estimate $\hat{b}_{u}$ as the average of $y_{u,i}-\hat{\mu}-\hat{b}_{i}$.
+
+```{r user_effects2, echo=TRUE, message=FALSE}
+user_avgs <- train_set %>%
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarise(b_u = mean(rating - mu - b_i))
+# now construct predictors and see if there is an improvement to RMSE.
+predicted_ratings <- test_set %>%
+  left_join(movie_avgs, by = "movieId") %>%
+  left_join(user_avgs, by = "userId") %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  pull(pred)
+
+plus_user <- RMSE(predicted_ratings, test_set$rating)
+plus_user
+```
+
+#### Regularisation
+
+Regularisation is a technique used to solve the problem of overfitting in Machine Learning models. Overfitting occurs when a model learns the detail and noise in the training data to an extent that it negatively impacts the performance of the model on new data.
+
+How do we solve for overfitting in our model? We penalise our loss function.
+
+Now let's look at instances of overfitting; the largest errors when we incorporate only movie effects.
+
+```{r reg_1, echo=TRUE, message=FALSE}
+test_set %>%
+  left_join(movie_avgs, by = "movieId") %>%
+  mutate(residual = rating - (mu + b_i)) %>%
+  arrange(desc(abs(residual))) %>%
+  slice(1:10) %>%
+  pull(title)
+```  
+
+Now let's look at the 10 worst and 10 best movies based on only $\hat{b}_{i}$.  
+
+First, connect movieId to title. 
+
+```{r ten_ten, echo=TRUE}
+movie_titles <- train_set %>%
+  select(movieId, title) %>%
+  distinct()
+```  
+Then the 10 best movies according to our estimate $\hat{b}_{i}$ are:
+
+```{r ten_best, echo=TRUE}
+movie_avgs %>% left_join(movie_titles, by = "movieId") %>%
+  arrange(desc(b_i)) %>%
+  slice(1:10) %>%
+  pull(title)
+
+```
+And the 10 worst are:
+
+```{r ten_worst, echo=TRUE}
+movie_avgs %>% left_join(movie_titles, by = "movieId") %>%
+  arrange(b_i) %>%
+  slice(1:10) %>%
+  pull(title)
+
+```
+
+These (10 'best' and 'worst' based upon $\hat{b}_{i}$ only) look obscure. See below how often they were rated.
+
+```{r best_rated_frq, echo=TRUE}
+train_set %>% count(movieId) %>%
+  left_join(movie_avgs, by = "movieId") %>%
+  left_join(movie_titles, by = "movieId") %>%
+  arrange(desc(b_i)) %>%
+  slice(1:10) %>%
+  pull(n)
+
+train_set %>% count(movieId) %>%
+  left_join(movie_avgs, by = "movieId") %>%
+  left_join(movie_titles, by = "movieId") %>%
+  arrange(b_i) %>%
+  slice(1:10) %>%
+  pull(n)
+```
+The 'best' and 'worst' movies were mostly rated by few users. This represents noise and  uncertainty and can result in large errors and consequently an increase in RMSE.
+
+Now to remedy these inconsistencies, we use regularisation to ameliorate the effects of different levels of uncertainty. 
+
+#### Regularisation for movie effects
+
+```{r lambda, echo=TRUE, message=FALSE}
+lambda <- 3
+mu <- mean(train_set$rating)
+movie_reg_avgs <- train_set %>%
+  group_by(movieId) %>%
+  summarise(b_i = sum(rating - mu)/(n() + lambda), n_i = n())
+```
+To see how the estimates shrink, below see a plot of the regularised estimates versus the least squares estimates.
+
+```{r reg_vs_least, echo=TRUE}
+tibble(original = movie_avgs$b_i, regularised = movie_reg_avgs$b_i, 
+       n = movie_reg_avgs$n_i) %>% 
+  ggplot(aes(original, regularised, size = sqrt(n))) +
+  geom_point(shape = 1, alpha = 0.5)
+  
+```
+
+Now let's look at the top 10 movies based on the penalised estimates $\hat{b}_{i}\left(\lambda\right)$.
+
+```{r penalised_top_10}
+train_set %>%
+  count(movieId) %>%
+  left_join(movie_reg_avgs, by = "movieId") %>%
+  left_join(movie_titles, by = "movieId") %>%
+  arrange(desc(b_i)) %>%
+  slice(1:10) %>%
+  pull(title)
+
+```
+
+And here are the 10 'worst' movies.
+
+```{r penalised_worst_10}
+train_set %>%
+  count(movieId) %>%
+  left_join(movie_reg_avgs, by = "movieId") %>%
+  left_join(movie_titles, by = "movieId") %>%
+  arrange(b_i) %>%
+  slice(1:10) %>%
+  pull(title)
+```
+
+Does the penalised version improve our result?
+
+```{r penalised_rmse}
+predicted_ratings <- test_set %>%
+  left_join(movie_reg_avgs, by = "movieId") %>%
+  mutate(pred = mu + b_i) %>%
+  pull(pred)
+
+reg_movie <- RMSE(predicted_ratings, test_set$rating)
+reg_movie
+```
+
+#### Regularisation for movie + user effects (cross-validation)
+
+We use regularisation to estimate for user effects as well. Below is the equation that describes the estimate.
+
+$\frac{1}{N}\sum_{u,i}\left(\hat{y}_{u,i}-\mu-b_{i}-b_{u}\right)^2+\lambda\left(\sum_{i}{b}^2_{i}+\sum_{u}{b}^2_{u}\right)$
+
+The solution (below) shows us using cross-validation to pick the parameter $\lambda$.
+
+```{r cross_validation, echo=TRUE, message=FALSE}
+lambdas <- seq(0, 10, 0.25)
+
+rmses <- sapply(lambdas, function(l){
+  
+  mu <- mean(train_set$rating)
+  
+  b_i <- train_set %>%
+    group_by(movieId) %>%
+    summarise(b_i = sum(rating - mu)/(n() + l))
+  
+  b_u <- train_set %>%
+    left_join(b_i, by = "movieId") %>%
+    group_by(userId) %>%
+    summarise(b_u = sum(rating - b_i - mu)/(n() + l))
+  
+  predicted_ratings <- test_set %>%
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = mu + b_i + b_u) %>%
+    pull(pred)
+  
+  return(RMSE(predicted_ratings, test_set$rating))
+})
+
+qplot(lambdas, rmses)
+
+lambda <- lambdas[which.min(rmses)]
+lambda
+
+reg_movie_user <- min(rmses)
+reg_movie_user
+```
+
+### Results
+
+#### Results with test set
+
+The results you see here mostly simulates the results seen in the course literature. Having said this, some of the code in the text contained some inconsistencies that required one to decipher these in order to complete the task. This task required a considerable amount of energy from a mind as limited in knowledge such as I have.
+
+```{r results, echo=FALSE}
+# Let's compare different approaches. 
+# Start by creating a results table with the naive approach
+(rmse_results <- tibble(method = c("Just the average", "Movie Effect Model", "Movie + User Effects Model", "Regularised Movie Effect Model", "Regularised Movie + User Effect Model"), 
+                        RMSE = c(naive_rmse, movie_effect, plus_user, reg_movie, reg_movie_user)))
+
+```
+
+#### Results with validation set
+
+```{r validation, echo=FALSE, message=FALSE}
+validation_set <- validation %>%
+  semi_join(train_set, by = "movieId") %>%
+  semi_join(train_set, by = "userId")
+
+# If we predict that all unknown ratings equals mu then the RMSE is:
+naive_rmse <- RMSE(validation_set$rating, mu_hat)
+naive_rmse
+
+# movie effects
+predicted_ratings <- mu + validation_set %>%
+  left_join(movie_avgs, by="movieId") %>%
+  pull(b_i)
+
+movie_effect <- RMSE(predicted_ratings, validation_set$rating)
+movie_effect
+
+# user effects
+user_avgs <- train_set %>%
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarise(b_u = mean(rating - mu - b_i))
+# now construct predictors and see if there is an improvement to RMSE.
+predicted_ratings <- validation_set %>%
+  left_join(movie_avgs, by = "movieId") %>%
+  left_join(user_avgs, by = "userId") %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  pull(pred)
+
+plus_user <- RMSE(predicted_ratings, validation_set$rating)
+plus_user
+
+# Regularisation for movie effects
+lambda <- 3
+mu <- mean(train_set$rating)
+movie_reg_avgs <- train_set %>%
+  group_by(movieId) %>%
+  summarise(b_i = sum(rating - mu)/(n() + lambda), n_i = n())
+
+predicted_ratings <- validation_set %>%
+  left_join(movie_reg_avgs, by = "movieId") %>%
+  mutate(pred = mu + b_i) %>%
+  pull(pred)
+
+reg_movie <- RMSE(predicted_ratings, validation_set$rating)
+reg_movie
+
+# cross validation and lambda
+# The solution (below) shows us using cross-validation to pick the parameter lambda
+lambdas <- seq(0, 10, 0.25)
+
+rmses <- sapply(lambdas, function(l){
+
+  mu <- mean(train_set$rating)
+
+  b_i <- train_set %>%
+    group_by(movieId) %>%
+    summarise(b_i = sum(rating - mu)/(n() + l))
+
+  b_u <- train_set %>%
+    left_join(b_i, by = "movieId") %>%
+    group_by(userId) %>%
+    summarise(b_u = sum(rating - b_i - mu)/(n() + l))
+
+  predicted_ratings <- validation_set %>%
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = mu + b_i + b_u) %>%
+    pull(pred)
+
+  return(RMSE(predicted_ratings, validation_set$rating))
+})
+
+qplot(lambdas, rmses)
+
+lambda <- lambdas[which.min(rmses)]
+lambda
+
+reg_movie_user <- min(rmses)
+reg_movie_user
+
+# Let's compare different approaches.
+# create a results table
+(rmse_results <- tibble(method = c("Just the average", "Movie Effect Model",
+                                   "Movie + User Effects Model",
+                                   "Regularised Movie Effect Model",
+                                   "Regularised Movie + User Effect Model"),
+                        RMSE = c(naive_rmse, movie_effect, plus_user,
+                                 reg_movie, reg_movie_user)))
+```
+### Conclusion
+
+This report articulates the primary objective of 1 of the 2 capstone projects; to simulate the solution offered by the winners of Netflix's 2006 challenge by applying their algorithmic approach to our project. We are called upon to predict the ratings of movies in a dataset by users, where no ratings were given.
+
+The limitations evident in this report are connected to the level of understanding the author has about Machine Learning, particularly his lack of depth of knowledge required to fully comprehend the many facets of ML. In the absence of a solid foundation in complementary subjects, such as linear algebra and principal components analysis, to name a few, it is extremely challenging to tackle a projectas complex as this one. Typically datasets have variables populated with data. NAs are the exception and strategies are available to tackle this obstacle. In this assignment, we have a dataset where most of the variables are populated with NAs. This makes this assignment an extremely difficult task.
+
+The winners of the competition won $1 million. I hypothesise that the reason for the generous sum can be found in recognition of the complexity of the challenge.
+
+I recommend that Harvard rethink placing this assignment before persons until they make clear that course registrants should be well versed in the disciplines listed above.
+
+In conclusion, I am curious to see how this challenge can be addressed using decision trees or random forests.
+
